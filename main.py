@@ -7,12 +7,14 @@ Fetches yfinance news data and stores it in ORE database (copper schema).
 import os
 import sys
 import logging
+import time
 import psycopg2
 from psycopg2.extras import execute_values
 from psycopg2 import sql
 from datetime import datetime, date, timedelta
 from typing import List, Set, Optional, Dict, Any
 from dotenv import load_dotenv
+from urllib.error import HTTPError
 import yfinance as yf
 import warnings
 
@@ -21,6 +23,15 @@ warnings.filterwarnings('ignore')
 
 # Load environment variables
 load_dotenv()
+
+# Rate limiting configuration from environment variables
+REQUEST_DELAY = float(os.getenv('YFINANCE_REQUEST_DELAY', '1.5'))  # seconds between requests
+MAX_RETRIES = int(os.getenv('YFINANCE_MAX_RETRIES', '3'))  # max retry attempts
+BASE_RETRY_DELAY = float(os.getenv('YFINANCE_BASE_RETRY_DELAY', '2.0'))  # base delay for exponential backoff
+
+# Backfill configuration
+BACKFILL_MODE = os.getenv('BACKFILL_MODE', 'false').lower() == 'true'  # Store all recent news, not just target date
+BACKFILL_LOOKBACK_DAYS = int(os.getenv('BACKFILL_LOOKBACK_DAYS', '14'))  # Max days to look back for backfilling
 
 # Configure logging
 logging.basicConfig(
@@ -179,123 +190,175 @@ def is_ticker_processed(ore_conn, ticker: str, target_date: date) -> bool:
 
 
 def fetch_yfinance_news(ticker: str) -> List[Dict[str, Any]]:
-    """Fetch news for a ticker from yfinance."""
-    try:
-        logger.info(f"Fetching news for ticker: {ticker}")
-        stock = yf.Ticker(ticker)
-        news_list = stock.news
-        
-        if not news_list:
-            logger.info(f"No news found for {ticker}")
-            return []
-        
-        processed_news = []
-        for news_item in news_list:
-            try:
-                # New yfinance format: data is nested in 'content' field
-                content = news_item.get('content')
-                if not content:
-                    # Fallback to old format (direct fields)
-                    content = news_item
-                
-                # Extract fields from content
-                title = content.get('title', '') or ''
-                summary = content.get('summary', '') or content.get('description', '') or ''
-                publisher = 'Unknown'
-                link = ''
-                pub_date = None
-                image_url = ''
-                
-                # Handle publisher - check provider field
-                provider = content.get('provider')
-                if provider:
-                    if isinstance(provider, dict):
-                        publisher = provider.get('displayName') or provider.get('name', 'Unknown') or 'Unknown'
-                    elif provider:
-                        publisher = str(provider)
-                
-                # Handle link/URL - check canonicalUrl or clickThroughUrl
-                url_obj = content.get('canonicalUrl') or content.get('clickThroughUrl') or content.get('url')
-                if isinstance(url_obj, dict):
-                    link = url_obj.get('url', '') or ''
-                elif url_obj:
-                    link = str(url_obj)
-                else:
-                    # Fallback to old format
-                    link = content.get('link', '') or ''
-                
-                # Handle image - check thumbnail field
-                thumbnail = content.get('thumbnail')
-                if thumbnail:
-                    if isinstance(thumbnail, dict):
-                        image_url = thumbnail.get('originalUrl', '') or thumbnail.get('url', '') or ''
-                    elif thumbnail:
-                        image_url = str(thumbnail)
-                else:
-                    # Fallback to old format
-                    image_obj = content.get('thumbnailUrl') or content.get('image')
-                    if isinstance(image_obj, dict):
-                        image_url = image_obj.get('url', '') or image_obj.get('src', '') or ''
-                    elif image_obj:
-                        image_url = str(image_obj)
-                
-                # Handle published date - check pubDate field
-                pub_date = content.get('pubDate') or content.get('providerPublishTime') or content.get('publishedAt')
-                if pub_date:
-                    try:
-                        if isinstance(pub_date, (int, float)):
-                            pub_date = datetime.fromtimestamp(pub_date)
-                        else:
-                            # Handle ISO format string
-                            pub_date_str = str(pub_date).replace('Z', '+00:00')
-                            pub_date = datetime.fromisoformat(pub_date_str)
-                    except (ValueError, TypeError, OSError) as e:
-                        logger.warning(f"Error parsing date for {ticker}: {e}, using current time")
+    """Fetch news for a ticker from yfinance with rate limiting and retries."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            if attempt > 0:
+                logger.info(f"Fetching news for ticker: {ticker} (attempt {attempt + 1}/{MAX_RETRIES})")
+            else:
+                logger.info(f"Fetching news for ticker: {ticker}")
+            
+            stock = yf.Ticker(ticker)
+            news_list = stock.news
+            
+            if not news_list:
+                logger.info(f"No news found for {ticker}")
+                return []
+            
+            processed_news = []
+            for news_item in news_list:
+                try:
+                    # New yfinance format: data is nested in 'content' field
+                    content = news_item.get('content')
+                    if not content:
+                        # Fallback to old format (direct fields)
+                        content = news_item
+                    
+                    # Extract fields from content
+                    title = content.get('title', '') or ''
+                    summary = content.get('summary', '') or content.get('description', '') or ''
+                    publisher = 'Unknown'
+                    link = ''
+                    pub_date = None
+                    image_url = ''
+                    
+                    # Handle publisher - check provider field
+                    provider = content.get('provider')
+                    if provider:
+                        if isinstance(provider, dict):
+                            publisher = provider.get('displayName') or provider.get('name', 'Unknown') or 'Unknown'
+                        elif provider:
+                            publisher = str(provider)
+                    
+                    # Handle link/URL - check canonicalUrl or clickThroughUrl
+                    url_obj = content.get('canonicalUrl') or content.get('clickThroughUrl') or content.get('url')
+                    if isinstance(url_obj, dict):
+                        link = url_obj.get('url', '') or ''
+                    elif url_obj:
+                        link = str(url_obj)
+                    else:
+                        # Fallback to old format
+                        link = content.get('link', '') or ''
+                    
+                    # Handle image - check thumbnail field
+                    thumbnail = content.get('thumbnail')
+                    if thumbnail:
+                        if isinstance(thumbnail, dict):
+                            image_url = thumbnail.get('originalUrl', '') or thumbnail.get('url', '') or ''
+                        elif thumbnail:
+                            image_url = str(thumbnail)
+                    else:
+                        # Fallback to old format
+                        image_obj = content.get('thumbnailUrl') or content.get('image')
+                        if isinstance(image_obj, dict):
+                            image_url = image_obj.get('url', '') or image_obj.get('src', '') or ''
+                        elif image_obj:
+                            image_url = str(image_obj)
+                    
+                    # Handle published date - check pubDate field
+                    pub_date = content.get('pubDate') or content.get('providerPublishTime') or content.get('publishedAt')
+                    if pub_date:
+                        try:
+                            if isinstance(pub_date, (int, float)):
+                                pub_date = datetime.fromtimestamp(pub_date)
+                            else:
+                                # Handle ISO format string
+                                pub_date_str = str(pub_date).replace('Z', '+00:00')
+                                pub_date = datetime.fromisoformat(pub_date_str)
+                        except (ValueError, TypeError, OSError) as e:
+                            logger.warning(f"Error parsing date for {ticker}: {e}, using current time")
+                            pub_date = datetime.now()
+                    else:
                         pub_date = datetime.now()
-                else:
-                    pub_date = datetime.now()
-                
-                # Skip if no meaningful content
-                if not title and not summary:
+                    
+                    # Skip if no meaningful content
+                    if not title and not summary:
+                        continue
+                    
+                    processed_news.append({
+                        'ticker': ticker,
+                        'title': title,
+                        'summary': summary,
+                        'publisher': publisher,
+                        'link': link,
+                        'published_date': pub_date,
+                        'image_url': image_url
+                    })
+                    
+                except Exception as e:
+                    logger.warning(f"Error processing news item for {ticker}: {e}")
                     continue
+            
+            logger.info(f"Fetched {len(processed_news)} news items for {ticker}")
+            return processed_news
+            
+        except HTTPError as e:
+            if e.code == 429:  # Rate limited
+                wait_time = BASE_RETRY_DELAY * (2 ** attempt)  # Exponential backoff
+                if attempt < MAX_RETRIES - 1:
+                    logger.warning(f"Rate limited for {ticker}. Waiting {wait_time:.1f}s before retry...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"Rate limited for {ticker} after {MAX_RETRIES} attempts")
+                    return []
+            else:
+                logger.error(f"HTTP error fetching news for {ticker}: {e.code}")
+                if attempt < MAX_RETRIES - 1:
+                    wait_time = BASE_RETRY_DELAY * (attempt + 1)
+                    logger.info(f"Waiting {wait_time:.1f}s before retry...")
+                    time.sleep(wait_time)
+                    continue
+                return []
                 
-                processed_news.append({
-                    'ticker': ticker,
-                    'title': title,
-                    'summary': summary,
-                    'publisher': publisher,
-                    'link': link,
-                    'published_date': pub_date,
-                    'image_url': image_url
-                })
-                
-            except Exception as e:
-                logger.warning(f"Error processing news item for {ticker}: {e}")
+        except Exception as e:
+            logger.error(f"ERROR: Failed to fetch news for ticker {ticker} (attempt {attempt + 1}/{MAX_RETRIES}): {e}", exc_info=True)
+            if attempt < MAX_RETRIES - 1:
+                wait_time = BASE_RETRY_DELAY * (attempt + 1)  # Progressive delay
+                logger.info(f"Waiting {wait_time:.1f}s before retry...")
+                time.sleep(wait_time)
                 continue
-        
-        logger.info(f"Fetched {len(processed_news)} news items for {ticker}")
-        return processed_news
-        
-    except Exception as e:
-        logger.error(f"ERROR: Failed to fetch news for ticker {ticker}: {e}", exc_info=True)
-        return []
+            return []
+    
+    return []
 
 
-def filter_news_by_date(news_list: List[Dict[str, Any]], target_date: date) -> List[Dict[str, Any]]:
-    """Filter news to only include items published on the target date."""
+def filter_news_by_date(news_list: List[Dict[str, Any]], target_date: date, lookback_days: int = None) -> List[Dict[str, Any]]:
+    """
+    Filter news to only include items published on the target date.
+    
+    In backfill mode, includes all news within the lookback window to capture overlapping news
+    when processing multiple recent dates.
+    """
     filtered = []
+    today = date.today()
+    
     for news_item in news_list:
         try:
             pub_date = news_item['published_date']
+            news_date = None
+            
             if isinstance(pub_date, datetime):
-                if pub_date.date() == target_date:
-                    filtered.append(news_item)
+                news_date = pub_date.date()
             elif isinstance(pub_date, date):
-                if pub_date == target_date:
+                news_date = pub_date
+            
+            if not news_date:
+                continue
+            
+            # In backfill mode, include all news within the lookback window
+            if BACKFILL_MODE and lookback_days:
+                days_ago = (today - news_date).days
+                if 0 <= days_ago <= lookback_days:
                     filtered.append(news_item)
+            # Normal mode: only include news from target date
+            elif news_date == target_date:
+                filtered.append(news_item)
+                
         except Exception as e:
             logger.warning(f"Error filtering news by date: {e}")
             continue
+    
     return filtered
 
 
@@ -347,6 +410,22 @@ def process_date_range(start_date: date, end_date: date, main_conn, ore_conn):
         logger.warning("No tickers found in database. Exiting.")
         return
     
+    # Warn about backfill limitations
+    today = date.today()
+    if BACKFILL_MODE:
+        logger.info(f"BACKFILL MODE ENABLED: Will store all news within {BACKFILL_LOOKBACK_DAYS} days")
+        logger.info("This allows capturing overlapping news when processing multiple recent dates")
+    else:
+        # Check if trying to backfill old dates
+        days_old = (today - end_date).days
+        if days_old > BACKFILL_LOOKBACK_DAYS:
+            logger.warning(
+                f"WARNING: End date ({end_date}) is {days_old} days old. "
+                f"yfinance only returns recent news (typically last 10-20 items). "
+                f"Backfilling dates older than {BACKFILL_LOOKBACK_DAYS} days may not work. "
+                f"Consider enabling BACKFILL_MODE=true to store all recent news regardless of target date."
+            )
+    
     # Process each date in the range
     current_date = start_date
     total_processed = 0
@@ -374,9 +453,17 @@ def process_date_range(start_date: date, end_date: date, main_conn, ore_conn):
             current_date += timedelta(days=1)
             continue
         
+        # Collect all news items for this day
+        daily_news = []
+        
         # Process each unprocessed ticker
-        for ticker in unprocessed_tickers:
+        for idx, ticker in enumerate(unprocessed_tickers):
             try:
+                # Add delay between requests to avoid rate limiting
+                if idx > 0:  # Don't delay before first request
+                    logger.debug(f"Waiting {REQUEST_DELAY}s before next request...")
+                    time.sleep(REQUEST_DELAY)
+                
                 # Fetch news for ticker
                 news_list = fetch_yfinance_news(ticker)
                 
@@ -384,23 +471,70 @@ def process_date_range(start_date: date, end_date: date, main_conn, ore_conn):
                     logger.info(f"No news found for {ticker} on {current_date}")
                     continue
                 
-                # Filter to only news from the target date
-                filtered_news = filter_news_by_date(news_list, current_date)
+                # Filter news based on mode
+                if BACKFILL_MODE:
+                    # In backfill mode, include all recent news within lookback window
+                    filtered_news = filter_news_by_date(news_list, current_date, BACKFILL_LOOKBACK_DAYS)
+                    if filtered_news:
+                        # Check if any news actually matches the target date
+                        matching_date = []
+                        for n in filtered_news:
+                            pd = n['published_date']
+                            if isinstance(pd, datetime):
+                                if pd.date() == current_date:
+                                    matching_date.append(n)
+                            elif isinstance(pd, date):
+                                if pd == current_date:
+                                    matching_date.append(n)
+                        if matching_date:
+                            logger.info(f"✓ Collected {len(filtered_news)} news items for {ticker} ({len(matching_date)} from {current_date}, {len(filtered_news) - len(matching_date)} from recent days)")
+                        else:
+                            logger.info(f"✓ Collected {len(filtered_news)} recent news items for {ticker} (none from {current_date}, but storing recent news for backfill)")
+                    else:
+                        logger.info(f"No recent news found for {ticker} (within {BACKFILL_LOOKBACK_DAYS} days)")
+                        continue
+                else:
+                    # Normal mode: only news from target date
+                    filtered_news = filter_news_by_date(news_list, current_date)
+                    if not filtered_news:
+                        # Check if news exists but is from different dates
+                        if news_list:
+                            news_dates = set()
+                            for n in news_list:
+                                pd = n['published_date']
+                                if isinstance(pd, datetime):
+                                    news_dates.add(pd.date())
+                                elif isinstance(pd, date):
+                                    news_dates.add(pd)
+                            if news_dates:
+                                oldest = min(news_dates)
+                                newest = max(news_dates)
+                                logger.info(f"No news for {ticker} published on {current_date} (fetched news from {oldest} to {newest})")
+                        else:
+                            logger.info(f"No news for {ticker} published on {current_date}")
+                        continue
+                    logger.info(f"✓ Collected {len(filtered_news)} news items for {ticker} on {current_date}")
                 
-                if not filtered_news:
-                    logger.info(f"No news for {ticker} published on {current_date}")
-                    continue
-                
-                # Insert into database
-                insert_news(ore_conn, filtered_news)
-                total_processed += len(filtered_news)
-                logger.info(f"✓ Successfully processed {len(filtered_news)} news items for {ticker} on {current_date}")
+                # Add to daily collection
+                daily_news.extend(filtered_news)
                 
             except Exception as e:
                 total_errors += 1
                 logger.error(f"ERROR: Failed to process ticker {ticker} for date {current_date}: {e}", exc_info=True)
                 logger.error(f"Continuing with next ticker...")
                 continue
+        
+        # Insert all news for this day at once
+        if daily_news:
+            try:
+                insert_news(ore_conn, daily_news)
+                total_processed += len(daily_news)
+                logger.info(f"✓ Successfully inserted {len(daily_news)} news items for {current_date}")
+            except Exception as e:
+                total_errors += 1
+                logger.error(f"ERROR: Failed to insert news for date {current_date}: {e}", exc_info=True)
+        else:
+            logger.info(f"No news items to insert for {current_date}")
         
         # Move to next date
         current_date += timedelta(days=1)
