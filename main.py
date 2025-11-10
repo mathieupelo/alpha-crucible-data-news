@@ -159,12 +159,21 @@ def create_news_table(conn):
 
 
 def get_distinct_tickers(main_conn) -> Set[str]:
-    """Get all distinct tickers from universe_tickers table."""
+    """Get all distinct tickers from varrock.tickers table (all tickers, even if not in universes)."""
     try:
         with main_conn.cursor() as cursor:
-            cursor.execute("SELECT DISTINCT ticker FROM universe_tickers ORDER BY ticker;")
+            # Query all tickers directly from varrock.tickers table
+            # Filter by is_active = TRUE to only get active tickers
+            # Use yfinance_symbol if available, otherwise use ticker
+            cursor.execute("""
+                SELECT DISTINCT 
+                    COALESCE(t.yfinance_symbol, t.ticker) as ticker
+                FROM varrock.tickers t
+                WHERE t.is_active = TRUE
+                ORDER BY ticker;
+            """)
             tickers = {row[0] for row in cursor.fetchall()}
-            logger.info(f"Found {len(tickers)} distinct tickers in database")
+            logger.info(f"Found {len(tickers)} distinct tickers in database (from varrock.tickers)")
             return tickers
     except Exception as e:
         logger.error(f"Error fetching distinct tickers: {e}")

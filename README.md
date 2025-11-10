@@ -13,7 +13,7 @@ This repository is responsible for:
 
 For each date in the specified range:
 
-1. **Fetch all distinct tickers** from the `universe_tickers` table in the main database
+1. **Fetch all distinct tickers** from the `varrock.tickers` table in the main database (all tickers, even if not in universes)
 2. **Check processing status** - verify if each ticker has already been processed for that date
 3. **Fetch news** - For unprocessed tickers, fetch all news from yfinance API
 4. **Filter by date** - Only keep news items published on the target date
