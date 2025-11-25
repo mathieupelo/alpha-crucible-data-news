@@ -21,8 +21,19 @@ import warnings
 # Suppress yfinance warnings
 warnings.filterwarnings('ignore')
 
-# Load environment variables
-load_dotenv()
+# Load environment variables - try Alpha-Crucible-Quant directory first
+from pathlib import Path
+env_path = Path(__file__).parent.parent / 'Alpha-Crucible-Quant' / '.env'
+if env_path.exists():
+    load_dotenv(env_path, override=True)
+else:
+    # Try immediate parent directory
+    env_path = Path(__file__).parent.parent / '.env'
+    if env_path.exists():
+        load_dotenv(env_path, override=True)
+    else:
+        # Fallback to current directory
+        load_dotenv()
 
 # Rate limiting configuration from environment variables
 REQUEST_DELAY = float(os.getenv('YFINANCE_REQUEST_DELAY', '1.5'))  # seconds between requests
@@ -591,6 +602,17 @@ def main():
         logger.info("="*60)
         logger.info("Starting yfinance news data fetch...")
         logger.info("="*60)
+        
+        # Log .env file location
+        env_path = Path(__file__).parent.parent / 'Alpha-Crucible-Quant' / '.env'
+        if env_path.exists():
+            logger.info(f"Loaded .env from: {env_path}")
+        else:
+            env_path = Path(__file__).parent.parent / '.env'
+            if env_path.exists():
+                logger.info(f"Loaded .env from: {env_path}")
+            else:
+                logger.info("Loaded .env from current directory")
         
         # Get date range
         start_date, end_date = get_date_range_from_env()
