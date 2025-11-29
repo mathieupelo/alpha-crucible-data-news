@@ -170,24 +170,29 @@ def create_news_table(conn):
 
 
 def get_distinct_tickers(main_conn) -> Set[str]:
-    """Get all distinct tickers from varrock.tickers table (all tickers, even if not in universes)."""
+    """Get all distinct tickers from the 'quest' universe."""
     try:
         with main_conn.cursor() as cursor:
-            # Query all tickers directly from varrock.tickers table
-            # Filter by is_active = TRUE to only get active tickers
+            # Query tickers from the 'quest' universe (case-insensitive match)
+            # Join universes -> universe_companies -> varrock.tickers
             # Use yfinance_symbol if available, otherwise use ticker
+            # Filter by is_active = TRUE
+            # Using ILIKE for case-insensitive matching to handle "QUEST Core Gaming (QUEST)" or similar
             cursor.execute("""
                 SELECT DISTINCT 
                     COALESCE(t.yfinance_symbol, t.ticker) as ticker
-                FROM varrock.tickers t
-                WHERE t.is_active = TRUE
+                FROM universes u
+                JOIN universe_companies uc ON u.id = uc.universe_id
+                JOIN varrock.tickers t ON uc.company_uid = t.company_uid
+                WHERE UPPER(u.name) LIKE '%QUEST%'
+                    AND t.is_active = TRUE
                 ORDER BY ticker;
             """)
             tickers = {row[0] for row in cursor.fetchall()}
-            logger.info(f"Found {len(tickers)} distinct tickers in database (from varrock.tickers)")
+            logger.info(f"Found {len(tickers)} distinct tickers from quest universe")
             return tickers
     except Exception as e:
-        logger.error(f"Error fetching distinct tickers: {e}")
+        logger.error(f"Error fetching distinct tickers from quest universe: {e}")
         raise
 
 
