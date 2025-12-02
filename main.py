@@ -174,18 +174,22 @@ def get_distinct_tickers(main_conn) -> Set[str]:
     try:
         with main_conn.cursor() as cursor:
             # Query tickers from the 'quest' universe (case-insensitive match)
-            # Join universes -> universe_companies -> varrock.tickers
-            # Use yfinance_symbol if available, otherwise use ticker
-            # Filter by is_active = TRUE
-            # Using ILIKE for case-insensitive matching to handle "QUEST Core Gaming (QUEST)" or similar
+            # Join universes -> universe_companies -> varrock.companies -> varrock.tickers
+            # This ensures we only get tickers for companies that:
+            #   1. Are in the quest universe (universe_companies)
+            #   2. Still exist in varrock.companies (not deleted)
+            #   3. Have active main tickers (is_active = TRUE, is_main_ticker = TRUE)
+            # Use yfinance_symbol if available (it's been updated to the correct value), otherwise use ticker
             cursor.execute("""
                 SELECT DISTINCT 
                     COALESCE(t.yfinance_symbol, t.ticker) as ticker
                 FROM universes u
                 JOIN universe_companies uc ON u.id = uc.universe_id
-                JOIN varrock.tickers t ON uc.company_uid = t.company_uid
+                JOIN varrock.companies c ON uc.company_uid = c.company_uid
+                JOIN varrock.tickers t ON c.company_uid = t.company_uid
                 WHERE UPPER(u.name) LIKE '%QUEST%'
                     AND t.is_active = TRUE
+                    AND t.is_main_ticker = TRUE
                 ORDER BY ticker;
             """)
             tickers = {row[0] for row in cursor.fetchall()}
